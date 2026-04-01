@@ -1,58 +1,85 @@
 # MetaClaw Attribution Extension
 
-## Abstract
+## What problem this project targets
 
-MetaClaw combines three adaptation channels at inference time: the base policy, retrieved skills, and long-term memory. A successful response may improve because the model itself adapted, because a skill provided the right procedure, or because memory supplied missing project context. This extension adds a lightweight attribution layer to MetaClaw so those cases are no longer treated as one undifferentiated training signal. It instruments the serving path to log augmentation provenance, computes overlap-based contribution proxies for skills, memory, and residual policy behavior, and supports offline routing analysis over where future learning should go. The goal is not to claim causal attribution, but to make continual learning in MetaClaw more attributable before changing the underlying learning rule.
+MetaClaw responses are jointly shaped by three sources:
 
-## What this extension is for
+- the base policy
+- retrieved skills
+- retrieved memory
 
-This advisor-demo prototype tries to answer one question:
+But the training pipeline still treats the final response as one undifferentiated unit. In the current setup, a skill-driven success can still look like a policy-learning signal.
 
-**When a MetaClaw response succeeds, should that signal update the base policy, become a reusable skill, or stay as memory?**
+This extension is a small diagnostic layer around that issue. It asks:
 
-It does that in three phases:
+**When a response succeeds, should that signal update the base policy, become a reusable skill, or stay as memory?**
 
-1. `metaclaw/` patch:
-   record provenance in the real serving pipeline
-2. `attribution/` analysis:
-   inspect sample logs and compare routing strategies
-3. optional training hook:
-   allow attribution-weighted advantages, but keep it off by default
+## What I changed
 
-## Directory guide
+This project has two layers:
 
-- `analysis.py`
-  Loads `training_samples`-style JSONL records and produces attribution summaries.
+1. **Attribution prototype**
+   It instruments the real MetaClaw serving path to log which skills and memories were injected, then computes lightweight overlap-based proxies for:
+   - skill contribution
+   - memory contribution
+   - residual policy contribution
 
-- `router.py`
-  Compares three routing strategies: naive, heuristic, and attribution-aware.
+2. **Offline training-signal A/B**
+   It scores real logged interactions with the PRM and compares:
+   - baseline reward / advantage
+   - attribution-weighted reward / advantage
 
-- `visualize.py`
-  Generates the four advisor-facing figures.
+The goal is not to claim causal attribution. The goal is to make MetaClaw's learning signal more attributable before changing the full RL rule.
 
-- `generate_synthetic_data.py`
-  Creates reproducible demo records with seven scenario types. This is support infrastructure only, not the main empirical claim.
+## Main result
 
-- `run_demo.py`
-  One command to generate demo records, summary JSON, and figures.
+On **3 real interactions**, the baseline GRPO-style signal collapsed because the PRM assigned the same positive reward to every sample:
 
-- `run_local_checks.py`
-  Small smoke test for all three phases.
+- baseline advantages: `[0.0, 0.0, 0.0]`
+- baseline reward std: `0.0`
 
-## Important scope note
+After attribution-weighting by residual policy contribution:
 
-The primary target of this extension is **real provenance-aware logs from the MetaClaw pipeline**.
+- weighted reward std: `0.0156`
+- weighted advantages: `[-0.115, 1.2782, -1.1632]`
 
-The synthetic generator in this directory exists only to:
-- make the demo reproducible
-- let us bootstrap analysis and figures without the full RL stack
-- provide a clean walkthrough artifact for an advisor
+So the current result is:
 
-It should **not** be presented as proof that attribution is causal or validated.
+**the baseline signal had no within-batch discrimination, while the attribution-weighted signal recovered non-zero variance and separated the samples.**
 
-## Commands to run locally
+## Where to look
 
-### 1. Generate the full demo package
+### GitHub entry points
+
+- [Draft PR: offline attribution-weighted training-signal A/B](https://github.com/MaaaryLee/MetaClaw-Merry/pull/1)
+- [Prototype branch](https://github.com/MaaaryLee/MetaClaw-Merry/tree/feature/attribution-routing-prototype)
+- [Offline A/B branch](https://github.com/MaaaryLee/MetaClaw-Merry/tree/codex/training-signal-ab)
+
+### Core implementation
+
+- [`../metaclaw/attribution.py`](../metaclaw/attribution.py)
+  Lightweight attribution logic: estimates skill, memory, and residual policy contribution from overlap signals.
+
+- [`../metaclaw/api_server.py`](../metaclaw/api_server.py)
+  Real serving path: injects skills and memories, logs provenance, and writes `training_samples.jsonl`.
+
+- [`run_training_signal_ab.py`](run_training_signal_ab.py)
+  Offline A/B script: scores real logged interactions with the PRM and compares baseline vs attribution-weighted rewards.
+
+### Result files
+
+- [`../records/training_signal_ab_summary.json`](../records/training_signal_ab_summary.json)
+  Main quantified result: reward variance and advantage comparison.
+
+- [`../records/training_samples_scored.jsonl`](../records/training_samples_scored.jsonl)
+  Scored sample log: real interactions plus PRM scores and attribution fields.
+
+- [`../records/training_samples.jsonl`](../records/training_samples.jsonl)
+  Raw provenance log: what MetaClaw recorded before offline scoring.
+
+## Quick reproduction
+
+### 1. Generate the demo package
 
 ```bash
 MPLCONFIGDIR=/tmp/metaclaw-mpl python3 attribution/run_demo.py
@@ -65,7 +92,7 @@ Success looks like:
 
 Failure looks like:
 - Python import errors
-- or matplotlib cache permission issues if `MPLCONFIGDIR` is not writable
+- matplotlib cache permission issues if `MPLCONFIGDIR` is not writable
 
 ### 2. Run the local smoke checks
 
@@ -78,17 +105,29 @@ Success looks like:
 - JSON with `phase_2_offline_analysis`
 - JSON with `phase_3_advantages`
 
-### 3. Analyze a real sample log later
+Failure looks like:
+- import errors
+- missing demo files
+
+### 3. Reproduce the offline training-signal A/B on real logs
 
 ```bash
-python3 attribution/analysis.py \
+python3 attribution/run_training_signal_ab.py \
   --records records/training_samples.jsonl \
-  --summary-out records/attribution_summary.json
+  --config benchmark/scripts/config/skills-only.local.yaml \
+  --scored-out records/training_samples_scored.jsonl \
+  --summary-out records/training_signal_ab_summary.json
 ```
 
 Success looks like:
-- non-zero sample counts
-- routing counts under `naive`, `heuristic`, and `attribution_aware`
+- `records/training_samples_scored.jsonl` exists
+- `records/training_signal_ab_summary.json` exists
+- the summary shows non-empty `weighted_advantages`
+
+Failure looks like:
+- missing API key / config errors
+- PRM scorer import errors
+- empty or malformed input logs
 
 ## Figure outputs
 
@@ -106,20 +145,20 @@ After `run_demo.py`, the advisor-facing figures live in `attribution/figures/`:
 ![Advantage shift](figures/03_advantage_shift.png)
 ![Scenario breakdown](figures/04_scenario_breakdown.png)
 
-## Environment note
+## Important scope note
 
-The offline demo and visualization stack do **not** require the full MetaClaw RL runtime.
+This is **preliminary offline evidence about the training signal**, not yet a claim of downstream RL improvement.
 
-If your local environment is missing serving dependencies such as `uvicorn`, you can still run:
-- `attribution/run_demo.py`
-- `attribution/run_local_checks.py`
-- `attribution/analysis.py`
+More specifically:
 
-That separation is intentional for advisor-facing reproducibility.
+- it shows a real credit-assignment weakness in the current MetaClaw reward path
+- it shows that attribution-weighting can fix a specific batch-level collapse case
+- it does **not** yet prove end-to-end benchmark gains
+- it does **not** yet provide token-level or span-level attribution
 
 ## Design discipline
 
 - backward compatible by default
 - attribution-weighted training is optional and experimental
 - no claim that the overlap proxy is causal
-- no requirement to boot the full MetaClaw training stack just to view the demo
+- no requirement to boot the full MetaClaw RL stack just to inspect the prototype
