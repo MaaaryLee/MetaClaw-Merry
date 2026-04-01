@@ -134,7 +134,7 @@ def _normalize_assistant_content_parts(content: list[dict]) -> tuple[str, list[d
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-_TOOL_HANDLE_RE = re.compile(r"^call_?(?:kimi|xml)_?\d?+$")
+_TOOL_HANDLE_RE = re.compile(r"^call_?(?:kimi|xml)_?\d+$")
 _TRAILING_DIGITS_RE = re.compile(r"\d+$")
 _FUNCTIONS_PREFIX_RE = re.compile(r"^functions[._]?")
 _KIMI_TOOL_CALL_RE = re.compile(
@@ -1324,6 +1324,40 @@ class MetaClawAPIServer:
                     response_text_simple,
                     augmentation_trace,
                     effective_memory_scope,
+                )
+                # When the upstream model does not have a local/HF tokenizer
+                # (for example Gemini in skills_only mode), we still want the
+                # advisor-demo attribution log to capture this turn even though
+                # it cannot become a real RL training sample.
+                self._append_sample_record(
+                    ConversationSample(
+                        session_id=session_id,
+                        turn_num=turn_num,
+                        prompt_tokens=[],
+                        response_tokens=[],
+                        response_logprobs=[],
+                        loss_mask=[],
+                        reward=0.0,
+                        prompt_text=prompt_text_simple,
+                        response_text=response_text_simple,
+                        teacher_logprobs=None,
+                        skill_generation=self.skill_manager.generation if self.skill_manager else 0,
+                        skill_names=[
+                            str(item.get("skill_name", "") or "")
+                            for item in provenance.get("skills", [])
+                            if item.get("skill_name")
+                        ],
+                        memory_ids=[
+                            str(item.get("memory_id", "") or "")
+                            for item in provenance.get("memories", [])
+                            if item.get("memory_id")
+                        ],
+                        skill_contribution_score=float(provenance.get("skill_bundle_overlap", 0.0) or 0.0),
+                        memory_contribution_score=float(provenance.get("memory_bundle_overlap", 0.0) or 0.0),
+                        policy_residual_proxy=float(provenance.get("policy_residual_proxy", 0.0) or 0.0),
+                        prm_votes=[],
+                        provenance=provenance,
+                    )
                 )
                 self._buffer_record(
                     session_id, turn_num, messages,
