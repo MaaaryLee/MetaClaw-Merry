@@ -249,7 +249,11 @@ class MetaClawTrainer:
         import tinker
 
         # Compute advantages (centre-normalise within batch)
-        advantages = compute_advantages(batch)
+        advantages = compute_advantages(
+            batch,
+            use_attribution=self.config.attribution_weighted_advantage,
+            policy_residual_floor=self.config.attribution_policy_residual_floor,
+        )
         kl_coef = self.config.kl_penalty_coef if self.config.use_opd else 0.0
         data_D = batch_to_datums(batch, advantages, kl_penalty_coef=kl_coef)
 

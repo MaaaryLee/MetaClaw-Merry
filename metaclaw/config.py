@@ -25,6 +25,8 @@ class MetaClawConfig:
     loss_fn: str = "importance_sampling"  # "ppo" | "importance_sampling" | "cispo"
     save_weights_timeout_s: float = 200.0  # timeout for sampling-client refresh
     resume_from_ckpt: str = ""    # optional Tinker resume path, e.g. tinker://.../weights/step_0003
+    attribution_weighted_advantage: bool = False
+    attribution_policy_residual_floor: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Reward / PRM                                                        #

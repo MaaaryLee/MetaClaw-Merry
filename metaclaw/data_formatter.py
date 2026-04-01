@@ -47,6 +47,13 @@ class ConversationSample:
     # Skill generation at collection time. Used by the RL trainer to discard
     # samples whose skills have since been superseded (MAML support/query separation).
     skill_generation: int = 0
+    skill_names: list[str] = field(default_factory=list)
+    memory_ids: list[str] = field(default_factory=list)
+    skill_contribution_score: float = 0.0
+    memory_contribution_score: float = 0.0
+    policy_residual_proxy: float = 0.0
+    prm_votes: list = field(default_factory=list)
+    provenance: dict = field(default_factory=dict)
 
 
 # ------------------------------------------------------------------ #
@@ -214,7 +221,12 @@ def batch_to_datums(
 # Advantage computation (GRPO-style group normalization)              #
 # ------------------------------------------------------------------ #
 
-def compute_advantages(batch: list[ConversationSample]) -> list[float]:
+def compute_advantages(
+    batch: list[ConversationSample],
+    *,
+    use_attribution: bool = False,
+    policy_residual_floor: float = 0.0,
+) -> list[float]:
     """
     Centre-and-scale rewards within the batch (GRPO style: (r - mean) / (std + eps)).
 
@@ -222,7 +234,14 @@ def compute_advantages(batch: list[ConversationSample]) -> list[float]:
     """
     if not batch:
         return []
-    rewards = [s.reward for s in batch]
+    residual_floor = max(0.0, min(1.0, policy_residual_floor))
+    rewards: list[float] = []
+    for sample in batch:
+        reward = sample.reward
+        if use_attribution:
+            policy_share = max(residual_floor, min(1.0, sample.policy_residual_proxy))
+            reward *= policy_share
+        rewards.append(reward)
     mean_r = sum(rewards) / len(rewards)
     variance = sum((r - mean_r) ** 2 for r in rewards) / len(rewards)
     std_r = variance ** 0.5

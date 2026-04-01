@@ -46,6 +46,8 @@ _DEFAULTS: dict = {
         "evolver_api_key": "",
         "evolver_model": "gpt-5.2",
         "manual_train_trigger": False,
+        "attribution_weighted_advantage": False,
+        "policy_residual_floor": 0.0,
     },
     "memory": {
         "enabled": False,
@@ -241,6 +243,8 @@ class ConfigStore:
             batch_size=int(rl.get("batch_size", 4)),
             resume_from_ckpt=str(rl.get("resume_from_ckpt", "") or ""),
             manual_train_trigger=bool(rl.get("manual_train_trigger", False)),
+            attribution_weighted_advantage=bool(rl.get("attribution_weighted_advantage", False)),
+            attribution_policy_residual_floor=float(rl.get("policy_residual_floor", 0.0)),
             # PRM (only meaningful in rl mode)
             use_prm=bool(rl.get("prm_url")) and rl_enabled,
             prm_url=rl.get("prm_url", "https://api.openai.com/v1"),
@@ -323,6 +327,8 @@ class ConfigStore:
                 f"rl.prm_url:      {rl.get('prm_url', '?')}",
                 f"rl.evolver_model:{rl.get('evolver_model', '?')}",
                 f"rl.resume_ckpt:  {rl.get('resume_from_ckpt', '')}",
+                f"rl.attr_adv:     {rl.get('attribution_weighted_advantage', False)}",
+                f"rl.attr_floor:   {rl.get('policy_residual_floor', 0.0)}",
             ]
         lines += [
             f"memory.enabled:  {memory.get('enabled', False)}",

@@ -33,6 +33,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import OpenAI
 
+from .attribution import finalize_provenance, serialize_memory, serialize_skill
 from .config import MetaClawConfig
 from .data_formatter import ConversationSample
 from .memory.scope import base_scope, derive_memory_scope
@@ -556,13 +557,17 @@ class MetaClawAPIServer:
         # Record files
         self._record_file = ""
         self._prm_record_file = ""
+        self._sample_record_file = ""
         if config.record_enabled:
             os.makedirs(config.record_dir, exist_ok=True)
             self._record_file = os.path.join(config.record_dir, "conversations.jsonl")
             self._prm_record_file = os.path.join(config.record_dir, "prm_scores.jsonl")
+            self._sample_record_file = os.path.join(config.record_dir, "training_samples.jsonl")
             with open(self._record_file, "w"):
                 pass
             with open(self._prm_record_file, "w"):
+                pass
+            with open(self._sample_record_file, "w"):
                 pass
 
         # Tokenizer is used in both modes for prompt length accounting/truncation,
@@ -990,8 +995,16 @@ class MetaClawAPIServer:
             except OSError as e:
                 logger.warning("[OpenClaw] failed to write record: %s", e)
 
-    def _buffer_record(self, session_id: str, turn_num: int, messages: list,
-                       prompt_text: str, response_text: str, tool_calls: list):
+    def _buffer_record(
+        self,
+        session_id: str,
+        turn_num: int,
+        messages: list,
+        prompt_text: str,
+        response_text: str,
+        tool_calls: list,
+        provenance: Optional[dict] = None,
+    ):
         if not self._record_file:
             return
         instruction_text = _extract_last_user_instruction(messages)
@@ -1004,7 +1017,33 @@ class MetaClawAPIServer:
             "prompt_text": prompt_text,
             "response_text": response_text,
             "tool_calls": tool_calls or None,
+            "provenance": provenance or {},
         }
+
+    def _append_sample_record(self, sample: ConversationSample) -> None:
+        if not self._sample_record_file:
+            return
+        payload = {
+            "session_id": sample.session_id,
+            "turn_num": sample.turn_num,
+            "reward": sample.reward,
+            "loss_mask_sum": sum(sample.loss_mask),
+            "prompt_token_count": len(sample.prompt_tokens),
+            "response_token_count": len(sample.response_tokens),
+            "skill_generation": sample.skill_generation,
+            "skill_names": sample.skill_names,
+            "memory_ids": sample.memory_ids,
+            "skill_contribution_score": sample.skill_contribution_score,
+            "memory_contribution_score": sample.memory_contribution_score,
+            "policy_residual_proxy": sample.policy_residual_proxy,
+            "prm_votes": sample.prm_votes,
+            "provenance": sample.provenance,
+        }
+        try:
+            with open(self._sample_record_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError as e:
+            logger.warning("[OpenClaw] failed to write sample record: %s", e)
 
     def _append_prm_record(self, session_id: str, turn_num: int,
                            score: float, votes: list):
@@ -1026,6 +1065,7 @@ class MetaClawAPIServer:
         for path, label in [
             (self._record_file, "record"),
             (self._prm_record_file, "PRM record"),
+            (self._sample_record_file, "sample record"),
         ]:
             if not path:
                 continue
@@ -1201,19 +1241,20 @@ class MetaClawAPIServer:
             self._session_memory_scopes[session_id] = effective_memory_scope
 
         # Inject memory and skills into system message for main turns
+        augmentation_trace: dict[str, Any] = {"mode": "none", "skills": [], "memories": []}
         if turn_type == "main":
             if (
                 self.memory_manager
                 and self.skill_manager
                 and self.config.synergy_enabled
             ):
-                messages = await self._inject_augmentation(
+                messages, augmentation_trace = await self._inject_augmentation(
                     messages, scope_id=effective_memory_scope,
                 )
             elif self.memory_manager:
-                messages = await self._inject_memory(messages, scope_id=effective_memory_scope)
+                messages, augmentation_trace = await self._inject_memory(messages, scope_id=effective_memory_scope)
             elif self.skill_manager:
-                messages = self._inject_skills(messages)
+                messages, augmentation_trace = self._inject_skills(messages)
         if cached_system:
             logger.info(
                 "[OpenClaw] system prompt cached len=%d",
@@ -1279,9 +1320,15 @@ class MetaClawAPIServer:
                 response_text_simple = content or (
                     json.dumps(tool_calls, ensure_ascii=False) if tool_calls else ""
                 )
+                provenance = self._finalize_request_provenance(
+                    response_text_simple,
+                    augmentation_trace,
+                    effective_memory_scope,
+                )
                 self._buffer_record(
                     session_id, turn_num, messages,
                     prompt_text_simple, response_text_simple, tool_calls,
+                    provenance=provenance,
                 )
                 turn_entry = {
                     "prompt_text": prompt_text_simple,
@@ -1374,7 +1421,20 @@ class MetaClawAPIServer:
                 "[OpenClaw] MAIN session=%s turn=%d prompt_tokens=%d response_tokens=%d",
                 session_id, turn_num, len(prompt_ids), len(response_ids),
             )
-            self._buffer_record(session_id, turn_num, messages, prompt_text, response_text, tool_calls)
+            provenance = self._finalize_request_provenance(
+                response_text,
+                augmentation_trace,
+                effective_memory_scope,
+            )
+            self._buffer_record(
+                session_id,
+                turn_num,
+                messages,
+                prompt_text,
+                response_text,
+                tool_calls,
+                provenance=provenance,
+            )
             # Skill evolution + memory: buffer turns for all modes (RL and skills_only).
             turn_entry = {"prompt_text": prompt_text, "response_text": response_text}
             evolution_every_n = getattr(self.config, "skill_evolution_every_n_turns", 10)
@@ -1389,6 +1449,7 @@ class MetaClawAPIServer:
                     self._safe_create_task(self._evolve_skills_for_session(evolution_turns))
             if _want_memory:
                 self._session_memory_turns.setdefault(session_id, []).append(turn_entry)
+            turn_data["provenance"] = provenance
             self._pending_turn_data.setdefault(session_id, {})[turn_num] = turn_data
             if self.config.use_opd and self._teacher_client:
                 self._fire_teacher_query(
@@ -1711,19 +1772,43 @@ class MetaClawAPIServer:
             )
         return result
 
-    def _inject_skills(self, messages: list[dict]) -> list[dict]:
+    def _current_memory_policy_version(self) -> int | None:
+        if not self.memory_manager or not getattr(self.memory_manager, "policy_store", None):
+            return None
+        try:
+            return int(self.memory_manager.policy_store.load().version)
+        except Exception:
+            return None
+
+    def _finalize_request_provenance(
+        self,
+        response_text: str,
+        trace: dict[str, Any],
+        memory_scope: str,
+    ) -> dict[str, Any]:
+        return finalize_provenance(
+            response_text,
+            mode=str(trace.get("mode", "none")),
+            skill_generation=self.skill_manager.generation if self.skill_manager else 0,
+            memory_scope=memory_scope or "",
+            memory_policy_version=self._current_memory_policy_version(),
+            skills=list(trace.get("skills", [])),
+            memories=list(trace.get("memories", [])),
+        )
+
+    def _inject_skills(self, messages: list[dict]) -> tuple[list[dict], dict[str, Any]]:
         """Prepend skill guidance to the system message."""
         if not self.skill_manager:
-            return messages
+            return messages, {"mode": "skills", "skills": [], "memories": []}
 
         user_msgs = [m for m in messages if m.get("role") == "user"]
         task_desc = _flatten_message_content(user_msgs[-1].get("content", "")) if user_msgs else ""
         if not task_desc:
-            return messages
+            return messages, {"mode": "skills", "skills": [], "memories": []}
 
         skills = self.skill_manager.retrieve(task_desc, top_k=self.config.skill_top_k)
         if not skills:
-            return messages
+            return messages, {"mode": "skills", "skills": [], "memories": []}
 
         skill_names = [
             s.get("name", s.get("id", "unknown_skill"))
@@ -1747,7 +1832,12 @@ class MetaClawAPIServer:
         else:
             messages.insert(0, {"role": "system", "content": skill_text})
 
-        return messages
+        trace = {
+            "mode": "skills",
+            "skills": [serialize_skill(skill, rank=i + 1) for i, skill in enumerate(skills)],
+            "memories": [],
+        }
+        return messages, trace
 
     # ------------------------------------------------------------------ #
     # Sample submission                                                    #
@@ -1811,6 +1901,7 @@ class MetaClawAPIServer:
     ):
         prompt_ids = turn_data["prompt_ids"]
         response_ids = turn_data["response_ids"]
+        provenance = dict(turn_data.get("provenance") or {})
 
         has_next_state = turn_data.get("has_next_state", False)
         score = prm_result["score"] if prm_result else 0.0
@@ -1839,6 +1930,21 @@ class MetaClawAPIServer:
             # Tag with current skill generation so the trainer can discard
             # pre-evolution samples (MAML support/query set separation).
             skill_generation=self.skill_manager.generation if self.skill_manager else 0,
+            skill_names=[
+                str(item.get("skill_name", "") or "")
+                for item in provenance.get("skills", [])
+                if item.get("skill_name")
+            ],
+            memory_ids=[
+                str(item.get("memory_id", "") or "")
+                for item in provenance.get("memories", [])
+                if item.get("memory_id")
+            ],
+            skill_contribution_score=float(provenance.get("skill_bundle_overlap", 0.0) or 0.0),
+            memory_contribution_score=float(provenance.get("memory_bundle_overlap", 0.0) or 0.0),
+            policy_residual_proxy=float(provenance.get("policy_residual_proxy", 0.0) or 0.0),
+            prm_votes=list(prm_result.get("votes", [])) if prm_result else [],
+            provenance=provenance,
         )
 
         if not exclude:
@@ -1853,6 +1959,7 @@ class MetaClawAPIServer:
             self._append_prm_record(
                 session_id, sample.turn_num, score, prm_result.get("votes", [])
             )
+        self._append_sample_record(sample)
 
         logger.info(
             "[OpenClaw] submitted sample session=%s index=%d score=%.1f exclude=%s "
@@ -1987,7 +2094,11 @@ class MetaClawAPIServer:
         except Exception as e:
             logger.error("[Memory] ingest failed for session=%s: %s", session_id, e, exc_info=True)
 
-    async def _inject_memory(self, messages: list[dict], scope_id: str = "") -> list[dict]:
+    async def _inject_memory(
+        self,
+        messages: list[dict],
+        scope_id: str = "",
+    ) -> tuple[list[dict], dict[str, Any]]:
         """Prepend relevant long-term memory to the system message.
 
         Retrieves from the base scope (session suffix stripped) so memories
@@ -1995,12 +2106,12 @@ class MetaClawAPIServer:
         a thread to avoid blocking the async event loop.
         """
         if not self.memory_manager:
-            return messages
+            return messages, {"mode": "memory", "skills": [], "memories": []}
 
         user_msgs = [m for m in messages if m.get("role") == "user"]
         task_desc = _flatten_message_content(user_msgs[-1].get("content", "")) if user_msgs else ""
         if not task_desc:
-            return messages
+            return messages, {"mode": "memory", "skills": [], "memories": []}
 
         # Use base scope for retrieval so memories are shared across sessions
         retrieval_scope = base_scope(scope_id) if scope_id else None
@@ -2009,7 +2120,7 @@ class MetaClawAPIServer:
         )
         if not memories:
             logger.info("[Memory] no memories retrieved, skipping injection for task=%s", task_desc[:80])
-            return messages
+            return messages, {"mode": "memory", "skills": [], "memories": []}
 
         memory_text = self.memory_manager.render_for_prompt(memories)
         logger.info(
@@ -2028,7 +2139,12 @@ class MetaClawAPIServer:
         else:
             messages.insert(0, {"role": "system", "content": memory_text})
 
-        return messages
+        trace = {
+            "mode": "memory",
+            "skills": [],
+            "memories": [serialize_memory(memory, rank=i + 1) for i, memory in enumerate(memories)],
+        }
+        return messages, trace
 
     def _get_memory_scope(self, session_id: str) -> str:
         if not self.memory_manager:
@@ -2112,7 +2228,7 @@ class MetaClawAPIServer:
         self,
         messages: list[dict],
         scope_id: str = "",
-    ) -> list[dict]:
+    ) -> tuple[list[dict], dict[str, Any]]:
         """Coordinated injection of both Memory and Skill.
 
         Replaces the separate _inject_memory + _inject_skills calls when both
@@ -2123,7 +2239,7 @@ class MetaClawAPIServer:
         3. Role-separated prompt template — LLM gets clear guidance on how to use each
         """
         if not self.memory_manager or not self.skill_manager:
-            return messages
+            return messages, {"mode": "synergy", "skills": [], "memories": []}
 
         user_msgs = [m for m in messages if m.get("role") == "user"]
         task_desc = (
@@ -2132,7 +2248,7 @@ class MetaClawAPIServer:
             else ""
         )
         if not task_desc:
-            return messages
+            return messages, {"mode": "synergy", "skills": [], "memories": []}
 
         # --- 1. Retrieve relevant skills (for template customization, not injection)
         skills = self.skill_manager.retrieve_relevant(
@@ -2210,4 +2326,9 @@ class MetaClawAPIServer:
         else:
             messages.insert(0, {"role": "system", "content": augmented_text})
 
-        return messages
+        trace = {
+            "mode": "synergy",
+            "skills": [serialize_skill(skill, rank=i + 1) for i, skill in enumerate(skills)],
+            "memories": [serialize_memory(memory, rank=i + 1) for i, memory in enumerate(memories)],
+        }
+        return messages, trace
