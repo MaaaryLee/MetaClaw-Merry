@@ -1030,6 +1030,8 @@ class MetaClawAPIServer:
             "loss_mask_sum": sum(sample.loss_mask),
             "prompt_token_count": len(sample.prompt_tokens),
             "response_token_count": len(sample.response_tokens),
+            "prompt_text": sample.prompt_text,
+            "response_text": sample.response_text,
             "skill_generation": sample.skill_generation,
             "skill_names": sample.skill_names,
             "memory_ids": sample.memory_ids,
