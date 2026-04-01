@@ -1,0 +1,53 @@
+{
+  "phase_1_provenance": {
+    "skill_bundle_overlap": 0.4545,
+    "memory_bundle_overlap": 0.3636,
+    "policy_residual_proxy": 0.1819,
+    "skill_count": 1,
+    "memory_count": 1
+  },
+  "phase_2_offline_analysis": {
+    "sample_count": 18,
+    "routing": {
+      "naive": {
+        "route_counts": {
+          "policy": 18
+        },
+        "policy_updates": 18,
+        "policy_update_reduction": 0
+      },
+      "heuristic": {
+        "route_counts": {
+          "policy": 7,
+          "mixed": 7,
+          "skill": 3,
+          "memory": 1
+        },
+        "policy_updates": 7,
+        "policy_update_reduction": 11
+      },
+      "attribution_aware": {
+        "route_counts": {
+          "policy": 7,
+          "mixed": 6,
+          "skill": 4,
+          "memory": 1
+        },
+        "policy_updates": 7,
+        "policy_update_reduction": 11
+      }
+    }
+  },
+  "phase_3_advantages": {
+    "baseline": [
+      0.7071,
+      0.7071,
+      -1.4142
+    ],
+    "attribution_weighted": [
+      0.1433,
+      1.1468,
+      -1.2901
+    ]
+  }
+}
